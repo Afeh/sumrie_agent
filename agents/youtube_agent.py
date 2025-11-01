@@ -6,7 +6,11 @@ from uuid import uuid4
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-from models.a2a import A2AMessage, TaskResult, TaskStatus, Artifact, MessagePart, MessageConfiguration
+
+from models.a2a import (
+    A2AMessage, TaskResult, TaskStatus, Artifact, MessagePart, 
+    MessageConfiguration, JSONRPCRequest, MessageParams
+)
 
 
 class YouTubeSummarizerAgent:
@@ -28,16 +32,28 @@ class YouTubeSummarizerAgent:
 
     # --- NEW METHOD TO SEND WEBHOOKS ---
     async def _send_webhook_notification(self, url: str, token: str, result: TaskResult):
-        """Sends the final task result to the provided webhook URL."""
+        """Builds and sends a full JSONRPCRequest to the webhook URL."""
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {token}"
         }
         try:
-            # THE FIX: Check if there is a message to send, and send ONLY the message.
             if result.status and result.status.message:
-                payload = result.status.message.model_dump(exclude_none=True)
-                print(f"Sending final MESSAGE to webhook: {url}")
+                # 1. Create the 'params' part of the request
+                message_params = MessageParams(message=result.status.message)
+                
+                # 2. Build the full JSON-RPC request envelope
+                webhook_request = JSONRPCRequest(
+                    jsonrpc="2.0",
+                    id=str(uuid4()), # Generate a new unique ID for this request
+                    method="message/send",
+                    params=message_params
+                )
+                
+                # 3. Convert the Pydantic model to a dictionary for sending
+                payload = webhook_request.model_dump(exclude_none=True)
+                
+                print(f"Sending final JSON-RPC REQUEST to webhook: {url}")
                 response = await self.http_client.post(url, json=payload, headers=headers)
                 response.raise_for_status()
                 print("Webhook notification sent successfully.")
@@ -46,7 +62,6 @@ class YouTubeSummarizerAgent:
 
         except httpx.HTTPError as e:
             print(f"Error sending webhook notification: {e}")
-            # Optional: Log the response body for more details on the error
             if 'response' in locals():
                 print(f"Webhook error response body: {response.text}")
 
