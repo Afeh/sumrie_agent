@@ -34,12 +34,22 @@ class YouTubeSummarizerAgent:
             "Authorization": f"Bearer {token}"
         }
         try:
-            print(f"Sending final result to webhook: {url}")
-            response = await self.http_client.post(url, json=result.model_dump(exclude_none=True), headers=headers)
-            response.raise_for_status()
-            print("Webhook notification sent successfully.")
+            # THE FIX: Check if there is a message to send, and send ONLY the message.
+            if result.status and result.status.message:
+                payload = result.status.message.model_dump(exclude_none=True)
+                print(f"Sending final MESSAGE to webhook: {url}")
+                response = await self.http_client.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+                print("Webhook notification sent successfully.")
+            else:
+                print("Webhook notification skipped: No final message in the task result.")
+
         except httpx.HTTPError as e:
             print(f"Error sending webhook notification: {e}")
+            # Optional: Log the response body for more details on the error
+            if 'response' in locals():
+                print(f"Webhook error response body: {response.text}")
+
 
     # This is the background task that does the actual work
     async def _do_summarization_and_notify(self, message: A2AMessage, webhook_url: str, webhook_token: str):
