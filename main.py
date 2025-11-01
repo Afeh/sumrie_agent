@@ -3,6 +3,8 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 import os
+import json
+from pydantic import ValidationError
 
 from models.a2a import JSONRPCRequest, JSONRPCResponse
 from agents.youtube_agent import YouTubeSummarizerAgent
@@ -42,23 +44,44 @@ app = FastAPI(
 
 
 @app.post("/a2a/summarize")
-async def a2a_endpoint(request: JSONRPCRequest):
+async def a2a_endpoint(request: Request): # Changed to accept a raw Request
     """Main A2A endpoint for the summarizer agent."""
+    
+    # 1. Get the raw JSON body from the request
+    body = await request.json()
+    
+    # 2. PRINT THE RAW BODY TO THE LOGS - THIS IS THE CRUCIAL PART
+    print("--- RAW TELEX REQUEST BODY ---")
+    print(json.dumps(body, indent=2))
+    print("----------------------------")
+
     try:
-        if request.method != "message/send":
+        # 3. Now, try to validate the body against our Pydantic model
+        rpc_request = JSONRPCRequest(**body)
+
+        if rpc_request.method != "message/send":
              raise HTTPException(status_code=400, detail="Method must be 'message/send'")
 
-        result = await agent.process_message(message=request.params.message)
-
-        response = JSONRPCResponse(id=request.id, result=result)
+        result = await agent.process_message(message=rpc_request.params.message)
+        response = JSONRPCResponse(id=rpc_request.id, result=result)
         return response.model_dump(exclude_none=True)
 
+    except ValidationError as e:
+        # If Pydantic validation fails, log the specific error
+        print("--- PYDANTIC VALIDATION FAILED ---")
+        print(e)
+        print("----------------------------------")
+        # Return a 422 error, which is what was happening automatically before
+        raise HTTPException(status_code=422, detail=e.errors())
+    
     except Exception as e:
+        # General error handling
+        request_id = body.get("id") if isinstance(body, dict) else None
         return JSONResponse(
             status_code=500,
             content={
                 "jsonrpc": "2.0",
-                "id": request.id if request else None,
+                "id": request_id,
                 "error": { "code": -32603, "message": "Internal error", "data": str(e) }
             }
         )
