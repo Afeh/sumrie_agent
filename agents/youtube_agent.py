@@ -6,7 +6,8 @@ from uuid import uuid4
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-from models.a2a import A2AMessage, TaskResult, TaskStatus, Artifact, MessagePart
+from models.a2a import A2AMessage, TaskResult, TaskStatus, Artifact, MessagePart, MessageConfiguration
+
 
 class YouTubeSummarizerAgent:
     def __init__(self, provider: str, google_api_key: str, openrouter_api_key: str, openrouter_model: str):
@@ -25,27 +26,98 @@ class YouTubeSummarizerAgent:
         else:
             raise ValueError(f"Unknown LLM_PROVIDER: '{self.provider}'. Must be 'google' or 'openrouter'.")
 
-    def _find_youtube_url_in_message(self, message: A2AMessage) -> Optional[str]:
-        """Searches through all message parts, including nested data, to find a YouTube URL."""
-        url_pattern = re.compile(r'(https?://(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[\w\-=&]+)')
+    # --- NEW METHOD TO SEND WEBHOOKS ---
+    async def _send_webhook_notification(self, url: str, token: str, result: TaskResult):
+        """Sends the final task result to the provided webhook URL."""
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}"
+        }
+        try:
+            print(f"Sending final result to webhook: {url}")
+            response = await self.http_client.post(url, json=result.model_dump(exclude_none=True), headers=headers)
+            response.raise_for_status()
+            print("Webhook notification sent successfully.")
+        except httpx.HTTPError as e:
+            print(f"Error sending webhook notification: {e}")
+
+    # This is the background task that does the actual work
+    async def _do_summarization_and_notify(self, message: A2AMessage, webhook_url: str, webhook_token: str):
+        """Runs the summarization and sends the result to a webhook."""
+        # This re-uses the same logic as the blocking mode
+        final_result = await self.process_message(message, MessageConfiguration(blocking=True))
+        await self._send_webhook_notification(webhook_url, webhook_token, final_result)
+
+    # --- UPDATED PROCESS_MESSAGE TO HANDLE BOTH MODES ---
+    async def process_message(self, message: A2AMessage, config: MessageConfiguration, background_tasks=None) -> TaskResult:
+        """The main processing pipeline for a summarization task."""
         
-        # Search in reverse to find the most recent message first
+        # --- NON-BLOCKING (WEBHOOK) LOGIC ---
+        if not config.blocking and config.pushNotificationConfig and background_tasks:
+            print("Running in NON-BLOCKING (webhook) mode.")
+            # Add the long-running job to the background
+            background_tasks.add_task(
+                self._do_summarization_and_notify,
+                message,
+                config.pushNotificationConfig.url,
+                config.pushNotificationConfig.token
+            )
+            # Immediately return a "working" response
+            task_id = message.taskId or str(uuid4())
+            context_id = str(uuid4())
+            return TaskResult(
+                id=task_id,
+                contextId=context_id,
+                status=TaskStatus(state="working")
+            )
+
+        # --- BLOCKING LOGIC (The code you already had) ---
+        print("Running in BLOCKING mode.")
+        task_id = message.taskId or str(uuid4())
+        context_id = str(uuid4())
+        extracted_url = self._find_youtube_url_in_message(message)
+        if not extracted_url: raise ValueError("No valid YouTube URL found in the message.")
+        video_id = self._get_video_id(extracted_url)
+        if not video_id: raise ValueError("Could not extract a valid video ID from the URL.")
+        try:
+            print(f"[{task_id}] Fetching transcript for video ID: {video_id}...")
+            transcript = self._get_transcript_from_api(video_id)
+            print(f"[{task_id}] Summarizing transcript...")
+            summary = await self._summarize_text(transcript)
+            response_message = A2AMessage(role="agent", parts=[MessagePart(kind="text", text=summary)], taskId=task_id)
+            artifacts = [Artifact(name="summary", parts=[MessagePart(kind="text", text=summary)]), Artifact(name="full_transcript", parts=[MessagePart(kind="text", text=transcript)])]
+            return TaskResult(id=task_id, contextId=context_id, status=TaskStatus(state="completed", message=response_message), artifacts=artifacts, history=[message, response_message])
+        except ValueError as e:
+            error_text = str(e)
+            error_message = A2AMessage(role="agent", parts=[MessagePart(kind="text", text=error_text)], taskId=task_id)
+            return TaskResult(id=task_id, contextId=context_id, status=TaskStatus(state="failed", message=error_message), history=[message, error_message])
+
+    # ... The rest of your agent file (_find_youtube_url_in_message, _get_video_id, etc.) remains the same ...
+    def _find_youtube_url_in_message(self, message: A2AMessage) -> Optional[str]:
+        url_pattern = re.compile(r'(https?://(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[\w\-=&]+)')
         for part in reversed(message.parts):
             if part.kind == "text" and part.text:
                 match = url_pattern.search(part.text)
-                if match:
-                    return match.group(0)
-            
-            # If the part contains data and that data is a list (like the history from Telex)
+                if match: return match.group(0)
             elif part.kind == "data" and isinstance(part.data, list):
-                # Search the history list in reverse
                 for item in reversed(part.data):
                     if isinstance(item, dict) and item.get("kind") == "text" and item.get("text"):
                         match = url_pattern.search(item["text"])
-                        if match:
-                            return match.group(0)
+                        if match: return match.group(0)
         return None
-
+    
+    async def _summarize_text(self, transcript: str) -> str:
+        prompt = f"Please summarize the following transcript:\n\n{transcript}"
+        system_prompt = "You are an expert at summarizing YouTube video transcripts. Provide a concise, easy-to-read summary that captures the key points. Crucially, the entire response must be in plain text, with no Markdown formatting (no headers, bold text, or lists)."
+        if self.provider == "google":
+            full_prompt = f"{system_prompt}\n\n{prompt}"
+            response = self.summarization_model.generate_content(full_prompt)
+            return response.text
+        elif self.provider == "openrouter":
+            response = await self.http_client.post(url="https://openrouter.ai/api/v1/chat/completions", headers={"Authorization": f"Bearer {self.openrouter_api_key}"}, json={"model": self.openrouter_model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]})
+            response.raise_for_status()
+            return response.json()['choices'][0]['message']['content']
+            
     def _get_video_id(self, url: str) -> Optional[str]:
         if not url: return None
         query = urlparse(url)
@@ -66,43 +138,3 @@ class YouTubeSummarizerAgent:
             raise ValueError(f"A transcript is not available for this video. Captions may be disabled.")
         except Exception as e:
             raise ValueError("An unexpected error occurred while trying to get the video transcript.")
-
-    async def _summarize_text(self, transcript: str) -> str:
-        prompt = f"Please summarize the following transcript:\n\n{transcript}"
-        system_prompt = "You are an expert at summarizing YouTube video transcripts. Provide a concise, easy-to-read summary that captures the key points. Crucially, the entire response must be in plain text, with no Markdown formatting (no headers, bold text, or lists)."
-        if self.provider == "google":
-            full_prompt = f"{system_prompt}\n\n{prompt}"
-            response = self.summarization_model.generate_content(full_prompt)
-            return response.text
-        elif self.provider == "openrouter":
-            response = await self.http_client.post(url="https://openrouter.ai/api/v1/chat/completions", headers={"Authorization": f"Bearer {self.openrouter_api_key}"}, json={"model": self.openrouter_model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}]})
-            response.raise_for_status()
-            return response.json()['choices'][0]['message']['content']
-
-    async def process_message(self, message: A2AMessage) -> TaskResult:
-        task_id = message.taskId or str(uuid4())
-        context_id = str(uuid4())
-
-        # Use the new, smarter method to find the URL
-        extracted_url = self._find_youtube_url_in_message(message)
-        
-        if not extracted_url:
-            raise ValueError("No valid YouTube URL found in the message.")
-
-        video_id = self._get_video_id(extracted_url)
-        
-        if not video_id:
-            raise ValueError("Could not extract a valid video ID from the URL.")
-
-        try:
-            print(f"[{task_id}] Fetching transcript for video ID: {video_id}...")
-            transcript = self._get_transcript_from_api(video_id)
-            print(f"[{task_id}] Summarizing transcript...")
-            summary = await self._summarize_text(transcript)
-            response_message = A2AMessage(role="agent", parts=[MessagePart(kind="text", text=summary)], taskId=task_id)
-            artifacts = [Artifact(name="summary", parts=[MessagePart(kind="text", text=summary)]), Artifact(name="full_transcript", parts=[MessagePart(kind="text", text=transcript)])]
-            return TaskResult(id=task_id, contextId=context_id, status=TaskStatus(state="completed", message=response_message), artifacts=artifacts, history=[message, response_message])
-        except ValueError as e:
-            error_text = str(e)
-            error_message = A2AMessage(role="agent", parts=[MessagePart(kind="text", text=error_text)], taskId=task_id)
-            return TaskResult(id=task_id, contextId=context_id, status=TaskStatus(state="failed", message=error_message), history=[message, error_message])
